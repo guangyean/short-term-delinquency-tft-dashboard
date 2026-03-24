@@ -116,19 +116,29 @@ def classify_change(delta: float | None, favorable_when: str, stable_threshold: 
     return "양호" if delta > 0 else "악화"
 
 
-def summarize_overall(statuses: list[str]) -> str:
+def summarize_overall(statuses: list[str]) -> tuple[str, str]:
     valid = [s for s in statuses if s in ["양호", "유지", "악화"]]
+    
     if not valid:
-        return "전월 비교 데이터 부족"
-    if valid.count("악화") >= 2:
-        return "전월대비 악화"
-    if all(s == "유지" for s in valid):
-        return "전월수준 유지"
-    if valid.count("양호") >= 2 and valid.count("악화") == 0:
-        return "전월대비 양호"
-    if valid.count("악화") == 0 and valid.count("유지") >= 1:
-        return "전월수준 유지"
-    return "전월대비 혼조"
+        return "❔", "데이터 부족"
+        
+    bad_cnt = valid.count("악화")
+    good_cnt = valid.count("양호")
+    
+    if bad_cnt >= 2:
+        return "🔴", "전반적 악화"
+    elif bad_cnt == 1:
+        if good_cnt > 0:
+            return "🟡", "일부 지표 악화"
+        else:
+            return "🟡", "전월대비 소폭 악화"
+    else:
+        if good_cnt >= 2:
+            return "🔵", "전반적 개선"
+        elif good_cnt == 1:
+            return "🟢", "전월대비 양호"
+        else:
+            return "⚪", "전월 수준 유지"
 
 
 def fmt_pp(delta: float | None, digits: int = 2) -> str:
@@ -169,8 +179,10 @@ def build_summary(prod_df: pd.DataFrame, promo_df: pd.DataFrame, company: str, p
             promo_text.append(f"{team} 목표 달성")
         elif val == "N":
             promo_text.append(f"{team} 목표 미달성")
+    signal, text = summarize_overall([status_roll, status_30, status_norm])
     return {
-        "overall": summarize_overall([status_roll, status_30, status_norm]),
+        "overall_signal": signal,
+        "overall_text": text,
         "metric_name_norm": norm_metric,
         "deltas": deltas,
         "promo_summary": ", ".join(promo_text) if promo_text else "프로모션 데이터 없음",
@@ -182,7 +194,7 @@ def render_summary_card(prod_df: pd.DataFrame, promo_df: pd.DataFrame, company: 
     st.markdown(f"### {product}")
     st.markdown(
         f"""
-**(종합)** {summary['overall']}  
+**(종합)** {summary['overall_signal']} {summary['overall_text']}  
 **연체전이율**  
 - 0→2 전이율: 전월대비 {fmt_pp(summary['deltas']['연체전이율 0→2'])}  
 - 0→1 전이율: 전월대비 {fmt_pp(summary['deltas']['연체전이율 0→1'])}  
@@ -556,7 +568,8 @@ def render_combined_summary(df, company, base_ym, selected_products):
             
         table_data.append({
             "상품명": product,
-            "종합평가": summary['overall'],
+            "시그널": summary['overall_signal'],
+            "종합평가": summary['overall_text'],
             "0→2 전이율": fmt_pp(summary['deltas']['연체전이율 0→2']),
             "0→1 전이율": fmt_pp(summary['deltas']['연체전이율 0→1']),
             "1→2 전이율": fmt_pp(summary['deltas']['연체전이율 1→2']),
@@ -573,29 +586,51 @@ def render_combined_summary(df, company, base_ym, selected_products):
         csv = summary_df.to_csv(index=False).encode('utf-8-sig')
         st.download_button("📥 CSV 다운로드", data=csv, file_name=f"{company}_단기연체요약_{base_ym}.csv", mime="text/csv", use_container_width=True)
 
-    def _highlight_bad(val):
-        if isinstance(val, str) and "↑" in val:
-            try:
-                num = float(val.split("%")[0].strip())
-                if num >= 0.3: return 'color: #D32F2F; font-weight: bold;'
-            except: pass
+    def highlight_delinquency(val):
+        if not isinstance(val, str): return ''
+        try:
+            num = float(val.split("%")[0].strip())
+            if "↑" in val and num >= 0.3: return 'color: #D32F2F; font-weight: bold;'
+            if "↓" in val and num >= 0.3: return 'color: #1976D2; font-weight: bold;'
+        except: pass
         return ''
-    def _highlight_good(val):
-        if isinstance(val, str) and "↑" in val:
-            try:
-                num = float(val.split("%")[0].strip())
-                if num >= 1.0: return 'color: #1976D2; font-weight: bold;'
-            except: pass
+
+    def highlight_normalization(val):
+        if not isinstance(val, str): return ''
+        try:
+            num = float(val.split("%")[0].strip())
+            if "↑" in val and num >= 1.0: return 'color: #1976D2; font-weight: bold;'
+            if "↓" in val and num >= 1.0: return 'color: #D32F2F; font-weight: bold;'
+        except: pass
         return ''
 
     bad_cols = [c for c in summary_df.columns if "전이율" in c or "연체율" in c]
     good_cols = [c for c in summary_df.columns if "정상화율" in c]
     
     styler = summary_df.style
-    if bad_cols: styler = styler.applymap(_highlight_bad, subset=bad_cols)
-    if good_cols: styler = styler.applymap(_highlight_good, subset=good_cols)
+    styler = styler.set_properties(subset=["시그널", "종합평가"], **{'text-align': 'center'})
+    if bad_cols: styler = styler.applymap(highlight_delinquency, subset=bad_cols)
+    if good_cols: styler = styler.applymap(highlight_normalization, subset=good_cols)
 
-    st.dataframe(styler, hide_index=True, use_container_width=True)
+    help_signal = (
+        "**[ 🎯 종합 평가 시그널 기준 ]**\n\n"
+        "- 🔴: **전반적 악화** (핵심지표 2개 이상 악화)\n"
+        "- 🟡: **일부 악화** (핵심지표 1개 악화)\n"
+        "- 🟢: **전월대비 양호** (악화된 지표 없이 1개 이상 개선)\n"
+        "- 🔵: **전반적 개선** (핵심지표 2개 이상 개선)\n"
+        "- ⚪: **전월 수준 유지** (모든 지표 전월과 동일)\n\n"
+        "*(※ 평가 대상: 0→2 전이율, 30D+ 실질연체율, 단기정상화율)*"
+    )
+    
+    st.dataframe(
+        styler, 
+        hide_index=True, 
+        use_container_width=True,
+        column_config={
+            "시그널": st.column_config.TextColumn("시그널", help=help_signal),
+            "종합평가": st.column_config.TextColumn("종합평가", help=help_signal)
+        }
+    )
 
     # 프로모션은 회사 단위라 한 번만
     promo_base = promo_df[(promo_df["자회사구분"] == company) & (promo_df["년월"] == base_ym)]
